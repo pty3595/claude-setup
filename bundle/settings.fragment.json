@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(sudo *)"
+    ]
+  },
+  "outputStyle": "Attention-kind",
+  "alwaysThinkingEnabled": true,
+  "autoMemoryEnabled": false
+}
