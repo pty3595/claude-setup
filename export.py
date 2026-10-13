@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """Claude Code 설정을 다른 서버로 옮길 묶음(bundle/)을 만든다.
 
-이 서버의 ~/.claude 를 훑어 옮길 수 있는 것만 골라 bundle/ 에 담고,
-받는 쪽 Claude가 읽고 따라 할 bundle/INSTALL.md 를 함께 쓴다.
+이 서버의 ~/.claude 에서 기본값이 아닌 것을 모두 훑고, 옮기기 어려운 것만 빼고 bundle/ 에 담는다.
+받는 쪽 Claude가 읽고 따라 할 bundle/INSTALL.md 도 함께 쓴다.
+
+기본은 옮긴다. 빼는 것은 이유가 분명할 때뿐이다.
+  - 비밀 정보 (토큰, 비밀번호)                      공개 저장소에 올릴 수 없다
+  - 이 기기를 가리키는 글 (이 기기가 붙은 네트워크의 IP, 여기 실제로 있는 경로)
+                                                 받는 쪽에는 그 자리가 없다
+  - 받는 쪽에서 쓸 수 없는 모델을 고정한 설정
+  - 인증에 묶인 설정, 이 기기 전용 설정 파일, MCP 서버
+node 나 웹 도구처럼 받는 쪽에 있어야 도는 것은 빼지 않고 INSTALL.md 에 적어 둔다.
 
     python3 export.py                         # 받는 쪽이 제한된 서버라고 본다
     python3 export.py --target-allows web     # 받는 쪽에서 되는 것을 알려 준다
@@ -13,10 +21,12 @@
 """
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -26,60 +36,115 @@ GLOBAL_CONFIG = SRC / ".claude.json" if os.environ.get("CLAUDE_CONFIG_DIR") else
 
 # ~/.claude 에서 옮길 후보. 여기 없는 것(세션 기록, 캐시, 인증 파일)은 보지 않는다.
 TOP_FILES = ["CLAUDE.md", "keybindings.json"]
-TOP_DIRS = ["skills", "agents", "commands", "output-styles", "rules"]
+TOP_DIRS = ["skills", "agents", "commands", "output-styles", "rules", "hooks"]
 SKIP = {"synced"}  # claude.ai 계정에서 내려오는 스킬. 받는 쪽 계정이 알아서 받는다
 
 # 이유 문구는 INSTALL.md 에 그대로 실린다. 걸린 글 자체는 어디에도 쓰지 않는다.
 SECRET = "비밀 정보로 보이는 글"
 MACHINE_PATH = "이 기기에만 있는 경로"
 MODEL_WHY = "받는 쪽에서 쓸 수 있는 모델이 다름"
-MARKERS = [
-    (re.compile(r"(?:/home|/Users)/[\w.-]+|~/(?!\.claude\b)[\w.-]+"), MACHINE_PATH),
-    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "IP 주소"),
-    (re.compile(r"ghp_\w{20,}|github_pat_\w+|sk-ant-[\w-]+|BEGIN [A-Z ]*PRIVATE KEY"
-                r"|(?i:password|passwd|secret|token)\s*[:=]\s*\S|비밀번호|자격 증명"), SECRET),
-]
-WEB = (re.compile(r"\b(?:WebFetch|WebSearch)\b"), "웹 도구(WebFetch · WebSearch)를 쓴다")
-RUNTIME = {"package.json", "requirements.txt", "pyproject.toml", "Cargo.toml", "go.mod"}
+WEB_NOTE = "웹 도구(WebFetch · WebSearch)를 언급한다"
+
+TOKEN = re.compile(r"ghp_\w{20,}|github_pat_\w+|sk-ant-[\w-]+|BEGIN [A-Z ]*PRIVATE KEY")
+# 코드에서는 token = ... 같은 변수가 흔해서, 느슨한 검사는 글과 설정 파일에만 건다
+LOOSE_SECRET = re.compile(r"(?i:password|passwd|secret|token)\s*[:=]\s*\S|비밀번호|자격 증명")
+PROSE = {".md", ".txt", ".env", ".yaml", ".yml", ".ini", ".toml", ".cfg", ".conf", ""}
+IP = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+HOME_PATH = re.compile(r"/home/[\w.-]+|/Users/[\w.-]+|~/([\w-][\w.-]*)")
+WEB = re.compile(r"\b(?:WebFetch|WebSearch)\b")
 RULE_PATH = re.compile(r"(?<!:)//|~/|/home/|/Users/")
 
-MODEL_KEYS = {"model", "fallbackModel", "modelSettings", "effortLevel", "maxEffortLevel",
-              "advisorModel", "fastMode", "availableModels", "modelOverrides"}
+MODEL_KEYS = {"model", "fallbackModel", "modelSettings", "advisorModel", "availableModels", "modelOverrides"}
 PLUGIN_KEYS = {"enabledPlugins", "extraKnownMarketplaces", "pluginConfigs"}
-MACHINE_KEYS = {"hooks", "statusLine", "subagentStatusLine", "fileSuggestion", "apiKeyHelper",
-                "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh", "otelHeadersHelper",
-                "proxyAuthHelper", "autoMemoryDirectory", "plansDirectory", "sshConfigs",
-                "remote", "sandbox", "worktree", "forceLoginMethod", "forceLoginOrgUUID"}
+LOCAL_KEYS = {"apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh",
+              "otelHeadersHelper", "proxyAuthHelper", "forceLoginMethod", "forceLoginOrgUUID",
+              "sshConfigs", "remote", "autoMemoryDirectory", "plansDirectory"}
 
 
 def load(path):
     return json.loads(path.read_text()) if path.exists() else {}
 
 
+PRIVATE = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+
+
+def local_networks():
+    """이 기기가 붙어 있는 네트워크. ip 명령이 없으면 사설 대역 전체로 넓게 본다."""
+    if not shutil.which("ip"):
+        return PRIVATE
+    out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
+    nets = [ipaddress.ip_interface(a).network for a in re.findall(r"inet (\S+)", out)]
+    return [n for n in nets if not n.is_loopback]
+
+
+NETWORKS = local_networks()
+
+
+def local_ip(text, prose):
+    """이 기기 주변을 가리키는 주소인가. 그림 좌표나 문서용 예시 주소는 걸리지 않는다.
+    사람이 쓴 글에서는 다른 내부망 주소일 수 있어 사설 대역까지 본다."""
+    try:
+        return any(ipaddress.ip_address(text) in n for n in NETWORKS + (PRIVATE if prose else []))
+    except ValueError:
+        return False
+
+
+def here_path(match, prose):
+    """글에 나온 경로가 이 기기를 가리키는가. 코드에서는 여기 실제로 있는 경로만 본다
+    (테스트용 /home/user 같은 것은 걸리지 않는다). 사람이 쓴 글의 /home/... 은 그대로 건다."""
+    under_home = match.group(1)
+    if under_home:
+        return (Path.home() / under_home).exists()
+    return prose or Path(match.group()).exists()
+
+
+def line_reasons(line, prose):
+    if TOKEN.search(line) or (prose and LOOSE_SECRET.search(line)):
+        yield SECRET
+    if any(local_ip(m.group(), prose) for m in IP.finditer(line)):
+        yield "내부망 IP 주소"
+    if any(here_path(m, prose) for m in HOME_PATH.finditer(line)):
+        yield MACHINE_PATH
+
+
+def runtime_needs(path):
+    """받는 쪽에 있어야 도는 것. 빼는 이유는 아니고 INSTALL.md 에 적는다."""
+    needs = []
+    if (path / "package.json").exists():
+        pkg = load(path / "package.json")
+        node = (pkg.get("engines") or {}).get("node")
+        needs.append(f"node {node} 필요" if node else "node 필요")
+        if pkg.get("dependencies"):
+            needs.append("`npm install` 필요")
+    needs += [f"추가 설치 필요 ({n})" for n in ("requirements.txt", "pyproject.toml", "Cargo.toml", "go.mod")
+              if (path / n).exists()]
+    return needs
+
+
 def scan(path, allows):
-    """파일이나 폴더에서 옮기기 어려운 표시를 찾는다. {이유: [위치, ...]}"""
-    hits = {}
+    """파일이나 폴더를 읽어 (빼는 이유 {이유: [위치]}, 받는 쪽에 필요한 것 [문구]) 를 낸다."""
+    why, needs = {}, []
     files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
-    markers = MARKERS + ([] if "web" in allows else [WEB])
     for f in files:
         rel = f.name if path.is_file() else str(f.relative_to(path))
-        if f.name in RUNTIME:
-            hits.setdefault("추가 설치가 필요하다", []).append(rel)
-        if f.stat().st_size > 1_000_000:
-            continue
         try:
             text = f.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
+        prose = f.suffix.lower() in PROSE
         for n, line in enumerate(text.splitlines(), 1):
-            for rx, why in markers:
-                if rx.search(line):
-                    hits.setdefault(why, []).append(f"{rel}:{n}")
-    return hits
+            for reason in line_reasons(line, prose):
+                why.setdefault(reason, []).append(f"{rel}:{n}")
+        if prose and "web" not in allows and WEB.search(text) and WEB_NOTE not in needs:
+            needs.append(WEB_NOTE)
+    if path.is_dir():
+        needs += runtime_needs(path)
+    return why, needs
 
 
 def file_item(item_id, path, allows, note=""):
-    return {"id": item_id, "src": path, "why": scan(path, allows), "note": note}
+    why, needs = scan(path, allows)
+    return {"id": item_id, "src": path, "why": why, "note": " · ".join(filter(None, [note, *needs]))}
 
 
 def env_reason(name, value, allows):
@@ -87,9 +152,9 @@ def env_reason(name, value, allows):
         return "" if "models" in allows else MODEL_WHY
     if re.search(r"KEY|TOKEN|SECRET|PASSWORD|AUTH", name):
         return SECRET
-    if re.search(r"URL|PROXY|PATH|DIR|HOME", name) or any(rx.search(value) for rx, _ in MARKERS):
+    if re.search(r"URL|PROXY|PATH|DIR|HOME", name):
         return "이 기기에 묶인 환경 변수"
-    return ""
+    return next(line_reasons(value, True), "")
 
 
 def setting_items(settings, allows):
@@ -117,13 +182,11 @@ def setting_items(settings, allows):
         elif key in MODEL_KEYS:
             add(key, (key,), val, "" if "models" in allows else MODEL_WHY)
         elif key in PLUGIN_KEYS:
-            add(key, (key,), val, "플러그인은 받는 쪽에서 직접 설치한다")
-        elif key in MACHINE_KEYS:
-            add(key, (key,), val, "명령 · 경로 · 인증이 이 기기에 묶인 설정")
-        elif isinstance(val, (dict, list)):
-            add(key, (key,), val, "모르는 구조의 설정 (확인 후 --include)")
+            add(key, (key,), val, "설정 키 대신 설치 명령으로 옮긴다 (플러그인)")
+        elif key in LOCAL_KEYS:
+            add(key, (key,), val, "인증이나 이 기기의 경로에 묶인 설정")
         else:
-            add(key, (key,), val)
+            add(key, (key,), val, next(line_reasons(json.dumps(val, ensure_ascii=False), True), ""))
     return items
 
 
@@ -140,7 +203,22 @@ def plugin_style(value):
     return None
 
 
-def collect(allows):
+def plugin_steps(settings):
+    """켜져 있는 플러그인을 받는 쪽에서 설치할 명령."""
+    markets = settings.get("extraKnownMarketplaces", {})
+    steps = []
+    for pid, on in settings.get("enabledPlugins", {}).items():
+        if not on:
+            continue
+        source = markets.get(pid.partition("@")[2], {}).get("source", {})
+        repo = source.get("repo") or source.get("url")
+        if repo and f"claude plugin marketplace add {repo}" not in steps:
+            steps.append(f"claude plugin marketplace add {repo}")
+        steps.append(f"claude plugin install {pid}")
+    return steps
+
+
+def collect(settings, allows):
     items = [file_item(n, SRC / n, allows) for n in TOP_FILES if (SRC / n).exists()]
     for d in TOP_DIRS:
         for p in sorted((SRC / d).glob("*")):
@@ -149,10 +227,10 @@ def collect(allows):
     if (SRC / "settings.local.json").exists():
         items.append({"id": "settings.local.json", "why": {"이 기기 전용 설정 파일": []}, "note": ""})
 
-    for it in setting_items(load(SRC / "settings.json"), allows):
+    for it in setting_items(settings, allows):
         path, value, _ = it["set"]
         if path == ("outputStyle",) and ":" in str(value):
-            # 플러그인은 옮기지 않으므로, 설정이 가리키는 스타일만 파일로 꺼낸다
+            # 플러그인 설치가 안 되는 곳에서도 지금 쓰는 스타일은 돌도록 파일로 꺼내 둔다
             found = plugin_style(value)
             if found:
                 f, lic, name = found
@@ -182,16 +260,27 @@ def public_id(item_id):
     return item_id.split("/")[0] + "/*" if "/" in item_id else item_id
 
 
-def install_md(included, excluded, fragment, allows):
+def install_md(included, excluded, fragment, plugins, allows):
     files = [it for it in included if "src" in it]
     gone = {}
     for it in excluded:
         gone.setdefault(public_id(it["id"]), []).append(it)
     assumed = [w for k, w in (("web", "웹 도구 없음"), ("models", "쓸 수 있는 모델이 다름")) if k not in allows]
+    plugin_part = [
+        "## 플러그인",
+        "",
+        "아래 명령으로 설치를 시도한다. 실패하면 고치려 하지 말고 출력을 사용자에게 알린 뒤 넘어간다.",
+        "실패해도 위의 설치는 그대로 유효하다.",
+        "",
+        "```bash",
+        *plugins,
+        "```",
+        "",
+    ] if plugins else []
     return "\n".join([
         "# Claude Code 설정 설치",
         "",
-        "다른 서버의 Claude Code 설정에서 옮길 수 있는 것만 골라 담은 묶음이다.",
+        "다른 서버의 Claude Code 설정에서 옮길 수 있는 것을 모두 담은 묶음이다.",
         "이 문서를 읽은 Claude는 아래를 그대로 따른다.",
         "",
         "- 파일 내용을 직접 다시 쓰지 않는다. 복사는 `install.sh`가 한다.",
@@ -226,11 +315,14 @@ def install_md(included, excluded, fragment, allows):
         json.dumps(fragment, indent=2, ensure_ascii=False),
         "```",
         "",
+        *plugin_part,
         "## 확인",
         "",
         "1. `install.sh` 출력에 오류가 없는지 본다. 줄 머리는 `new` · `replaced` · `same` · `set` 중 하나다.",
         "2. `bash install.sh`를 한 번 더 돌려 모든 줄이 `same`인지 본다.",
-        "3. 설정은 새 세션부터 적용된다고 사용자에게 알린다.",
+        "3. \"들어 있는 것\"의 비고에 \"필요\"가 있으면 받는 쪽에 그것이 있는지 본다 (예: `node --version`).",
+        "   없으면 설치하려 하지 말고, 그 항목이 동작하지 않는다고 사용자에게 알린다.",
+        "4. 설정은 새 세션부터 적용된다고 사용자에게 알린다.",
         "",
         "## 뺀 것",
         "",
@@ -243,6 +335,7 @@ def install_md(included, excluded, fragment, allows):
         "",
         "- `install.sh` 출력 전체",
         "- 백업 폴더가 생겼다면 그 경로",
+        "- 받는 쪽에 없어서 동작하지 않는 항목",
         "- 실패한 단계가 있으면 그 출력",
         "",
     ])
@@ -257,7 +350,8 @@ def main():
     args = ap.parse_args()
     allows = set(args.target_allows)
 
-    items = collect(allows)
+    settings = load(SRC / "settings.json")
+    items = collect(settings, allows)
     unknown = [i for i in args.include + args.exclude if i not in {it["id"] for it in items}]
     if unknown:
         ap.error("모르는 항목: " + ", ".join(unknown))
@@ -294,8 +388,9 @@ def main():
                 d.setdefault(path[-1], []).append(value)
             else:
                 d[path[-1]] = value
+    plugins = plugin_steps(settings)
     (out / "settings.fragment.json").write_text(json.dumps(fragment, indent=2, ensure_ascii=False) + "\n")
-    (out / "INSTALL.md").write_text(install_md(included, excluded, fragment, allows))
+    (out / "INSTALL.md").write_text(install_md(included, excluded, fragment, plugins, allows))
     listed = sorted(p for p in out.rglob("*") if p.is_file())
     (out / "MANIFEST.sha256").write_text("".join(
         f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out)}\n" for p in listed))
@@ -304,6 +399,8 @@ def main():
     for it in included:
         value = f" = {json.dumps(it['set'][1], ensure_ascii=False)}" if "set" in it and not it["set"][2] else ""
         print(f"  {it['id']}{value}" + (f"   ← {it['note']}" if it["note"] else ""))
+    for step in plugins:
+        print(f"  (설치 명령) {step}")
     print(f"\n뺀다 ({len(excluded)})")
     for it in excluded:
         whys = [w + (f" ({loc[0]}" + (f" 외 {len(loc) - 1}곳)" if len(loc) > 1 else ")") if loc else "")

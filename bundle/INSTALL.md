@@ -1,6 +1,6 @@
 # Claude Code 설정 설치
 
-다른 서버의 Claude Code 설정에서 옮길 수 있는 것만 골라 담은 묶음이다.
+다른 서버의 Claude Code 설정에서 옮길 수 있는 것을 모두 담은 묶음이다.
 이 문서를 읽은 Claude는 아래를 그대로 따른다.
 
 - 파일 내용을 직접 다시 쓰지 않는다. 복사는 `install.sh`가 한다.
@@ -26,6 +26,7 @@ bash install.sh
 | 항목 | 설치 위치 | 비고 |
 |---|---|---|
 | `CLAUDE.md` | `~/.claude/CLAUDE.md` |  |
+| `skills/archify` | `~/.claude/skills/archify` | node >=18 필요 |
 | `skills/verification-before-completion` | `~/.claude/skills/verification-before-completion` |  |
 | `output-styles/attention-kind.md` | `~/.claude/output-styles/attention-kind.md` | 플러그인 attention-span 에서 꺼냄 |
 
@@ -42,31 +43,44 @@ bash install.sh
   },
   "outputStyle": "Attention-kind",
   "alwaysThinkingEnabled": true,
-  "autoMemoryEnabled": false
+  "autoMemoryEnabled": false,
+  "effortLevel": "xhigh"
 }
+```
+
+## 플러그인
+
+아래 명령으로 설치를 시도한다. 실패하면 고치려 하지 말고 출력을 사용자에게 알린 뒤 넘어간다.
+실패해도 위의 설치는 그대로 유효하다.
+
+```bash
+claude plugin marketplace add alexgreensh/attention-span
+claude plugin install attention-span@attention-span
 ```
 
 ## 확인
 
 1. `install.sh` 출력에 오류가 없는지 본다. 줄 머리는 `new` · `replaced` · `same` · `set` 중 하나다.
 2. `bash install.sh`를 한 번 더 돌려 모든 줄이 `same`인지 본다.
-3. 설정은 새 세션부터 적용된다고 사용자에게 알린다.
+3. "들어 있는 것"의 비고에 "필요"가 있으면 받는 쪽에 그것이 있는지 본다 (예: `node --version`).
+   없으면 설치하려 하지 말고, 그 항목이 동작하지 않는다고 사용자에게 알린다.
+4. 설정은 새 세션부터 적용된다고 사용자에게 알린다.
 
 ## 뺀 것
 
 | 항목 | 이유 |
 |---|---|
-| `skills/*` (4개) | IP 주소 / 비밀 정보로 보이는 글 / 이 기기에만 있는 경로 / 추가 설치가 필요하다 |
+| `skills/*` (3개) | 내부망 IP 주소 / 비밀 정보로 보이는 글 / 이 기기에만 있는 경로 |
 | `settings.local.json` | 이 기기 전용 설정 파일 |
 | `settings:env` | 받는 쪽에서 쓸 수 있는 모델이 다름 |
 | `settings:model` | 받는 쪽에서 쓸 수 있는 모델이 다름 |
-| `settings:enabledPlugins` | 플러그인은 받는 쪽에서 직접 설치한다 |
-| `settings:extraKnownMarketplaces` | 플러그인은 받는 쪽에서 직접 설치한다 |
-| `settings:effortLevel` | 받는 쪽에서 쓸 수 있는 모델이 다름 |
+| `settings:enabledPlugins` | 설정 키 대신 설치 명령으로 옮긴다 (플러그인) |
+| `settings:extraKnownMarketplaces` | 설정 키 대신 설치 명령으로 옮긴다 (플러그인) |
 | `settings:modelSettings` | 받는 쪽에서 쓸 수 있는 모델이 다름 |
 
 ## 사용자에게 알릴 것
 
 - `install.sh` 출력 전체
 - 백업 폴더가 생겼다면 그 경로
+- 받는 쪽에 없어서 동작하지 않는 항목
 - 실패한 단계가 있으면 그 출력

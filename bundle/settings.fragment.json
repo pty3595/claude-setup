@@ -6,5 +6,6 @@
   },
   "outputStyle": "Attention-kind",
   "alwaysThinkingEnabled": true,
-  "autoMemoryEnabled": false
+  "autoMemoryEnabled": false,
+  "effortLevel": "xhigh"
 }
